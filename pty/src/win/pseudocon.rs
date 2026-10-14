@@ -28,6 +28,16 @@ pub const PSEUDOCONSOLE_WIN32_INPUT_MODE: u32 = 0x4;
 #[allow(dead_code)]
 pub const PSEUDOCONSOLE_PASSTHROUGH_MODE: u32 = 0x8;
 
+fn flags(inherit_cursor: bool) -> u32 {
+    PSEUDOCONSOLE_RESIZE_QUIRK
+        | PSEUDOCONSOLE_WIN32_INPUT_MODE
+        | if inherit_cursor {
+            PSEUDOCONSOLE_INHERIT_CURSOR
+        } else {
+            0
+        }
+}
+
 shared_library!(ConPtyFuncs,
     pub fn CreatePseudoConsole(
         size: COORD,
@@ -75,16 +85,19 @@ impl Drop for PseudoCon {
 }
 
 impl PseudoCon {
-    pub fn new(size: COORD, input: FileDescriptor, output: FileDescriptor) -> Result<Self, Error> {
+    pub fn new(
+        size: COORD,
+        input: FileDescriptor,
+        output: FileDescriptor,
+        inherit_cursor: bool,
+    ) -> Result<Self, Error> {
         let mut con: HPCON = INVALID_HANDLE_VALUE;
         let result = unsafe {
             (CONPTY.CreatePseudoConsole)(
                 size,
                 input.as_raw_handle(),
                 output.as_raw_handle(),
-                PSEUDOCONSOLE_INHERIT_CURSOR
-                    | PSEUDOCONSOLE_RESIZE_QUIRK
-                    | PSEUDOCONSOLE_WIN32_INPUT_MODE,
+                flags(inherit_cursor),
                 &mut con,
             )
         };
@@ -132,6 +145,8 @@ impl PseudoCon {
         let cmd_os = OsString::from_wide(&cmdline);
 
         let cwd = cmd.current_directory();
+        let creation_flags =
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | cmd.creation_flags;
 
         let res = unsafe {
             CreateProcessW(
@@ -140,7 +155,7 @@ impl PseudoCon {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                creation_flags,
                 cmd.environment_block().as_mut_slice().as_mut_ptr() as *mut _,
                 cwd.as_ref()
                     .map(|c| c.as_slice().as_ptr())
@@ -163,11 +178,24 @@ impl PseudoCon {
 
         // Make sure we close out the thread handle so we don't leak it;
         // we do this simply by making it owned
-        let _main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
+        let main_thread = unsafe { OwnedHandle::from_raw_handle(pi.hThread as _) };
         let proc = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as _) };
 
         Ok(WinChild {
             proc: Mutex::new(proc),
+            main_thread: Mutex::new(main_thread),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_inheritance_is_optional() {
+        assert_ne!(flags(true) & PSEUDOCONSOLE_INHERIT_CURSOR, 0);
+        assert_eq!(flags(false) & PSEUDOCONSOLE_INHERIT_CURSOR, 0);
+        assert_eq!(flags(true) & !PSEUDOCONSOLE_INHERIT_CURSOR, flags(false));
     }
 }
